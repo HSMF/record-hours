@@ -104,6 +104,9 @@ pub enum Commands {
     Show {
         #[clap(short, long)]
         project: Option<String>,
+        /// display time in decimal format: e.g. 1 hour, 45 minutes = 1.75
+        #[clap(short, long)]
+        decimal: bool,
     },
 }
 
@@ -200,7 +203,16 @@ impl Display for MyDuration {
     }
 }
 
-fn show(input: impl Read, project: &str) -> anyhow::Result<()> {
+struct DecimalDuration(Duration);
+
+impl Display for DecimalDuration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.02}", self.0.num_minutes() as f64 / 60.0)?;
+        Ok(())
+    }
+}
+
+fn show(input: impl Read, project: &str, decimal: bool) -> anyhow::Result<()> {
     fn get_times<'a>(
         mut iter: impl Iterator<Item = &'a TimeStamp>,
         mut start: Time,
@@ -242,7 +254,12 @@ fn show(input: impl Read, project: &str) -> anyhow::Result<()> {
             let mut f = std::io::stdout().lock();
             let duration: Duration = times.0.iter().map(|x| x.end.0 - x.start.0).sum();
 
-            writeln!(f, "{date} ({}):", MyDuration(duration))?;
+            let duration: Box<dyn Display> = if decimal {
+                Box::new(DecimalDuration(duration))
+            } else {
+                Box::new(MyDuration(duration))
+            };
+            writeln!(f, "{date} ({}):", duration)?;
             for Item { start, end } in times.0 {
                 writeln!(f, "  - {start} - {end}")?;
             }
@@ -278,11 +295,11 @@ fn main() -> anyhow::Result<()> {
             // recorder.commit(std::io::stdout().lock())?;
             recorder.commit(outfile)?;
         }
-        Commands::Show { project } => {
+        Commands::Show { project, decimal } => {
             let project = project.unwrap_or_default();
             let path = app.file.unwrap_or_else(|| PathBuf::from("hours.log.json"));
             let infile = File::open(path)?;
-            show(infile, &project)?;
+            show(infile, &project, decimal)?;
         }
     }
 

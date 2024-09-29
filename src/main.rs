@@ -3,7 +3,6 @@ use std::{
     fmt::Display,
     fs::File,
     io::{Read, Write},
-    iter::Sum,
     path::PathBuf,
     str::FromStr,
 };
@@ -11,7 +10,10 @@ use std::{
 use anyhow::{anyhow, Context};
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use clap::{Parser, Subcommand};
+use log::warn;
 use serde::{Deserialize, Serialize};
+
+mod format;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 struct Date(NaiveDate);
@@ -102,11 +104,30 @@ pub enum Commands {
         project: Option<String>,
     },
     Show {
+        /// show for specific project.
+        ///
+        /// May be repeated.
+        ///
+        /// --project "" shows only the default project
         #[clap(short, long)]
-        project: Option<String>,
+        project: Vec<String>,
         /// display time in decimal format: e.g. 1 hour, 45 minutes = 1.75
         #[clap(short, long)]
         decimal: bool,
+        /// Display format.
+        ///
+        /// Variables that can be used for expansion:
+        /// %d => date in y-m-d
+        /// %Y => year
+        /// %M => month
+        /// %D => day
+        /// %t => decimal time that has been recorded
+        /// %h => hours that have been recorded
+        /// %m => minutes that have been recorded
+        /// %P => the project
+        /// %% => a literal '%'
+        #[clap(short, long)]
+        format: Option<String>,
     },
 }
 
@@ -212,7 +233,10 @@ impl Display for DecimalDuration {
     }
 }
 
-fn show(input: impl Read, project: &str, decimal: bool) -> anyhow::Result<()> {
+fn show<F>(input: impl Read, project: &str, display: F) -> anyhow::Result<()>
+where
+    F: Fn(&Date, Vec<Item>, Option<Time>) -> anyhow::Result<()>,
+{
     fn get_times<'a>(
         mut iter: impl Iterator<Item = &'a TimeStamp>,
         mut start: Time,
@@ -250,23 +274,7 @@ fn show(input: impl Read, project: &str, decimal: bool) -> anyhow::Result<()> {
         };
         let times = get_times(iter, start.time);
 
-        {
-            let mut f = std::io::stdout().lock();
-            let duration: Duration = times.0.iter().map(|x| x.end.0 - x.start.0).sum();
-
-            let duration: Box<dyn Display> = if decimal {
-                Box::new(DecimalDuration(duration))
-            } else {
-                Box::new(MyDuration(duration))
-            };
-            writeln!(f, "{date} ({}):", duration)?;
-            for Item { start, end } in times.0 {
-                writeln!(f, "  - {start} - {end}")?;
-            }
-            if let Some(start) = times.1 {
-                writeln!(f, "  - {start} - ")?;
-            }
-        }
+        display(date, times.0, times.1)?;
     }
 
     Ok(())
@@ -295,11 +303,50 @@ fn main() -> anyhow::Result<()> {
             // recorder.commit(std::io::stdout().lock())?;
             recorder.commit(outfile)?;
         }
-        Commands::Show { project, decimal } => {
-            let project = project.unwrap_or_default();
+        Commands::Show {
+            project,
+            decimal,
+            format,
+        } => {
+            if project.len() > 1 {
+                warn!("specifying multiple projects isn't implemented atm")
+            }
+            let project = project.first().cloned().unwrap_or_default();
             let path = app.file.unwrap_or_else(|| PathBuf::from("hours.log.json"));
             let infile = File::open(path)?;
-            show(infile, &project, decimal)?;
+
+            if let Some(format) = &format {
+                show(infile, &project, |&date, times, _| {
+                    let duration: Duration = times.iter().map(|x| x.end.0 - x.start.0).sum();
+                    let fmt = format::Formatter {
+                        date,
+                        duration,
+                        format,
+                        project: &project,
+                    };
+                    println!("{fmt}");
+                    Ok(())
+                })?;
+                return Ok(());
+            }
+            show(infile, &project, |date, times, last| {
+                let mut f = std::io::stdout().lock();
+                let duration: Duration = times.iter().map(|x| x.end.0 - x.start.0).sum();
+
+                let duration: Box<dyn Display> = if decimal {
+                    Box::new(DecimalDuration(duration))
+                } else {
+                    Box::new(MyDuration(duration))
+                };
+                writeln!(f, "{date} ({}):", duration)?;
+                for Item { start, end } in times {
+                    writeln!(f, "  - {start} - {end}")?;
+                }
+                if let Some(start) = last {
+                    writeln!(f, "  - {start} - ")?;
+                }
+                Ok(())
+            })?;
         }
     }
 

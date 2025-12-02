@@ -7,13 +7,15 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use clap::{Parser, Subcommand};
 use log::warn;
 use serde::{Deserialize, Serialize};
 
 mod format;
+
+const DEFAULT_TOLERANCE: u32 = 15 * 60;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 struct Date(NaiveDate);
@@ -43,13 +45,13 @@ impl Display for Time {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct Log {
     projects: BTreeMap<String, Project>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct Project {
     entries: BTreeMap<Date, Vec<TimeStamp>>,
@@ -61,22 +63,19 @@ pub struct Entry {
     timestamps: Vec<TimeStamp>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq)]
 pub struct TimeStamp {
     #[serde(rename = "type")]
     typ: TimeStampType,
     time: Time,
     /// tolerance (for how to merge entries) in seconds
     tolerance: u32,
+    sub_project: Option<String>,
 }
 
 impl TimeStamp {
     fn is_start(&self) -> bool {
         self.typ == TimeStampType::Start
-    }
-
-    fn is_end(&self) -> bool {
-        self.typ == TimeStampType::End
     }
 }
 
@@ -102,6 +101,8 @@ pub enum Commands {
         auto: bool,
         #[clap(short, long)]
         project: Option<String>,
+        #[clap(short, long)]
+        sub_project: Option<String>,
     },
     Show {
         /// show for specific project.
@@ -128,6 +129,9 @@ pub enum Commands {
         /// %% => a literal '%'
         #[clap(short, long)]
         format: Option<String>,
+        /// show different sub projects
+        #[clap(short, long)]
+        group_by_subproject: bool,
     },
 }
 
@@ -161,7 +165,7 @@ impl Record {
         })
     }
 
-    fn insert(&mut self, project: String) {
+    fn insert(&mut self, project: String, mut sub_project: Option<String>) {
         let entry = self
             .log
             .projects
@@ -171,27 +175,62 @@ impl Record {
             .entry(self.date)
             .or_default();
 
-        if let Some(last_timestamp) = entry.last_mut() {
+        let Some(last_timestamp) = entry.last() else {
+            entry.push(TimeStamp {
+                typ: TimeStampType::Start,
+                time: self.time,
+                tolerance: DEFAULT_TOLERANCE,
+                sub_project,
+            });
+            return;
+        };
+
+        let same_project = last_timestamp.sub_project == sub_project;
+        let is_start = last_timestamp.is_start();
+        // same project, different project
+        // last is Start, last is End
+        // last is within tolerance, last is outside of tolerance
+        //
+        // s S y -> add end(s)
+        // s S n -> add end(s)
+        // s E y -> update time(s)
+        // s E n -> add start(s)
+        // d S y -> add end(s), add start(d)
+        // d S n -> add end(s), add start(d)
+        // d E y -> update time(s), add start(d)
+        // d E n -> add start(d)
+        if is_start {
+            let sub_project = last_timestamp.sub_project.clone();
+            entry.push(TimeStamp {
+                typ: TimeStampType::End,
+                time: self.time,
+                tolerance: DEFAULT_TOLERANCE,
+                sub_project,
+            });
+        } else {
             let dur = Duration::seconds(last_timestamp.tolerance as i64);
             let now = NaiveDateTime::new(self.date.0, self.time.0);
             let last_acceptable = NaiveDateTime::new(self.date.0, last_timestamp.time.0) + dur;
-            if last_timestamp.is_end() && now <= last_acceptable {
-                last_timestamp.time = self.time;
-                return;
+            if now <= last_acceptable {
+                entry.last_mut().unwrap().time = self.time;
+            } else if same_project {
+                entry.push(TimeStamp {
+                    typ: TimeStampType::Start,
+                    time: self.time,
+                    tolerance: DEFAULT_TOLERANCE,
+                    sub_project: sub_project.take(),
+                });
             }
         }
 
-        let typ = if entry.last().is_some_and(|l| l.is_start()) {
-            TimeStampType::End
-        } else {
-            TimeStampType::Start
-        };
-
-        entry.push(TimeStamp {
-            typ,
-            time: self.time,
-            tolerance: 60 * 15,
-        });
+        if !same_project {
+            entry.push(TimeStamp {
+                typ: TimeStampType::Start,
+                time: self.time,
+                tolerance: DEFAULT_TOLERANCE,
+                sub_project,
+            });
+        }
     }
 
     fn commit(&self, output: impl Write) -> anyhow::Result<()> {
@@ -203,13 +242,6 @@ impl Record {
 struct Item {
     start: Time,
     end: Time,
-}
-
-impl Item {
-    fn duration(&self) -> i64 {
-        let delta = self.end.0 - self.start.0;
-        delta.num_seconds()
-    }
 }
 
 struct MyDuration(Duration);
@@ -285,7 +317,11 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     match app.command {
-        Commands::Record { auto: _, project } => {
+        Commands::Record {
+            auto: _,
+            project,
+            sub_project,
+        } => {
             let project = project.unwrap_or_default();
             let path = app.file.unwrap_or_else(|| PathBuf::from("hours.log.json"));
 
@@ -296,7 +332,7 @@ fn main() -> anyhow::Result<()> {
                 Record::open(infile)?
             };
 
-            recorder.insert(project);
+            recorder.insert(project, sub_project);
 
             let outfile = File::create(&path)?;
 
@@ -307,6 +343,7 @@ fn main() -> anyhow::Result<()> {
             project,
             decimal,
             format,
+            group_by_subproject,
         } => {
             if project.len() > 1 {
                 warn!("specifying multiple projects isn't implemented atm")
@@ -314,6 +351,11 @@ fn main() -> anyhow::Result<()> {
             let project = project.first().cloned().unwrap_or_default();
             let path = app.file.unwrap_or_else(|| PathBuf::from("hours.log.json"));
             let infile = File::open(path)?;
+
+            // TODO: make use of group_by_subproject
+            if group_by_subproject {
+                todo!("grouping by subproject is not yet supported")
+            }
 
             if let Some(format) = &format {
                 show(infile, &project, |&date, times, _| {
@@ -351,4 +393,331 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::zero_prefixed_literal)]
+mod tests {
+    use super::*;
+
+    macro_rules! date {
+        ($y:literal-$M:literal-$d:literal) => {
+            Date(NaiveDate::from_ymd_opt($y, $M, $d).unwrap())
+        };
+    }
+    macro_rules! time {
+        ($h:literal:$m:literal:$s:literal) => {
+            Time(NaiveTime::from_hms_opt($h, $m, $s).unwrap())
+        };
+    }
+    macro_rules! record {
+        ($y:literal-$M:literal-$d:literal, $h:literal:$m:literal:$s:literal, $log:expr) => {
+            Record {
+                log: $log,
+                date: Date(NaiveDate::from_ymd_opt($y, $M, $d).unwrap()),
+                time: Time(NaiveTime::from_hms_opt($h, $m, $s).unwrap()),
+            }
+        };
+        ($y:literal-$M:literal-$d:literal, $h:literal:$m:literal:$s:literal) => {
+            Record {
+                log: Default::default(),
+                date: Date(NaiveDate::from_ymd_opt($y, $M, $d).unwrap()),
+                time: Time(NaiveTime::from_hms_opt($h, $m, $s).unwrap()),
+            }
+        };
+    }
+
+    fn with_empty_project(entries: BTreeMap<Date, Vec<TimeStamp>>) -> Log {
+        Log {
+            projects: BTreeMap::from([(String::new(), Project { entries })]),
+        }
+    }
+
+    fn on_date(date: Date, timestamps: impl IntoIterator<Item = TimeStamp>) -> Log {
+        with_empty_project(BTreeMap::from([(date, timestamps.into_iter().collect())]))
+    }
+
+    #[test]
+    fn insert_at_empty_log() {
+        let mut record = record!(2025-12-02, 11:00:00);
+        record.insert(String::new(), None);
+        assert_eq!(
+            record.log,
+            on_date(
+                date!(2025 - 12 - 02),
+                vec![TimeStamp {
+                    typ: TimeStampType::Start,
+                    time: time!(11:00:00),
+                    tolerance: DEFAULT_TOLERANCE,
+                    sub_project: None
+                }]
+            )
+        );
+    }
+
+    #[test]
+    fn insert_same_project_after_start() {
+        let initial = on_date(
+            date!(2025 - 12 - 02),
+            vec![TimeStamp {
+                typ: TimeStampType::Start,
+                time: time!(11:00:00),
+                tolerance: DEFAULT_TOLERANCE,
+                sub_project: None,
+            }],
+        );
+        let mut record = record!(2025-12-02, 11:03:00, initial);
+        record.insert(String::new(), None);
+        assert_eq!(
+            record.log,
+            on_date(
+                date!(2025 - 12 - 02),
+                [
+                    TimeStamp {
+                        typ: TimeStampType::Start,
+                        time: time!(11:00:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None
+                    },
+                    TimeStamp {
+                        typ: TimeStampType::End,
+                        time: time!(11:03:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None
+                    }
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn insert_different_project_after_start() {
+        let initial = on_date(
+            date!(2025 - 12 - 02),
+            vec![TimeStamp {
+                typ: TimeStampType::Start,
+                time: time!(11:00:00),
+                tolerance: DEFAULT_TOLERANCE,
+                sub_project: None,
+            }],
+        );
+        let mut record = record!(2025-12-02, 11:03:00, initial);
+        record.insert(String::new(), Some("foo".into()));
+        assert_eq!(
+            record.log,
+            on_date(
+                date!(2025 - 12 - 02),
+                [
+                    TimeStamp {
+                        typ: TimeStampType::Start,
+                        time: time!(11:00:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None
+                    },
+                    TimeStamp {
+                        typ: TimeStampType::End,
+                        time: time!(11:03:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None
+                    },
+                    TimeStamp {
+                        typ: TimeStampType::Start,
+                        time: time!(11:03:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: Some("foo".into())
+                    }
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn insert_same_project_after_end_bump_time() {
+        let initial = on_date(
+            date!(2025 - 12 - 02),
+            vec![
+                TimeStamp {
+                    typ: TimeStampType::Start,
+                    time: time!(11:00:00),
+                    tolerance: DEFAULT_TOLERANCE,
+                    sub_project: None,
+                },
+                TimeStamp {
+                    typ: TimeStampType::End,
+                    time: time!(11:03:00),
+                    tolerance: DEFAULT_TOLERANCE,
+                    sub_project: None,
+                },
+            ],
+        );
+        let mut record = record!(2025-12-02, 11:04:00, initial);
+        record.insert(String::new(), None);
+        assert_eq!(
+            record.log,
+            on_date(
+                date!(2025 - 12 - 02),
+                vec![
+                    TimeStamp {
+                        typ: TimeStampType::Start,
+                        time: time!(11:00:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None,
+                    },
+                    TimeStamp {
+                        typ: TimeStampType::End,
+                        time: time!(11:04:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None,
+                    },
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn insert_same_project_after_end_no_bump_time() {
+        let initial = on_date(
+            date!(2025 - 12 - 02),
+            vec![
+                TimeStamp {
+                    typ: TimeStampType::Start,
+                    time: time!(11:00:00),
+                    tolerance: DEFAULT_TOLERANCE,
+                    sub_project: None,
+                },
+                TimeStamp {
+                    typ: TimeStampType::End,
+                    time: time!(11:03:00),
+                    tolerance: DEFAULT_TOLERANCE,
+                    sub_project: None,
+                },
+            ],
+        );
+        let mut record = record!(2025-12-02, 11:44:00, initial);
+        record.insert(String::new(), None);
+        assert_eq!(
+            record.log,
+            on_date(
+                date!(2025 - 12 - 02),
+                vec![
+                    TimeStamp {
+                        typ: TimeStampType::Start,
+                        time: time!(11:00:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None,
+                    },
+                    TimeStamp {
+                        typ: TimeStampType::End,
+                        time: time!(11:03:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None,
+                    },
+                    TimeStamp {
+                        typ: TimeStampType::Start,
+                        time: time!(11:44:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None,
+                    },
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn insert_different_project_after_end_bump_time() {
+        let initial = on_date(
+            date!(2025 - 12 - 02),
+            vec![
+                TimeStamp {
+                    typ: TimeStampType::Start,
+                    time: time!(11:00:00),
+                    tolerance: DEFAULT_TOLERANCE,
+                    sub_project: None,
+                },
+                TimeStamp {
+                    typ: TimeStampType::End,
+                    time: time!(11:03:00),
+                    tolerance: DEFAULT_TOLERANCE,
+                    sub_project: None,
+                },
+            ],
+        );
+        let mut record = record!(2025-12-02, 11:04:00, initial);
+        record.insert(String::new(), Some("foo".into()));
+        assert_eq!(
+            record.log,
+            on_date(
+                date!(2025 - 12 - 02),
+                vec![
+                    TimeStamp {
+                        typ: TimeStampType::Start,
+                        time: time!(11:00:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None,
+                    },
+                    TimeStamp {
+                        typ: TimeStampType::End,
+                        time: time!(11:04:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None,
+                    },
+                    TimeStamp {
+                        typ: TimeStampType::Start,
+                        time: time!(11:04:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: Some("foo".into()),
+                    },
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn insert_different_project_after_end_no_bump_time() {
+        let initial = on_date(
+            date!(2025 - 12 - 02),
+            vec![
+                TimeStamp {
+                    typ: TimeStampType::Start,
+                    time: time!(11:00:00),
+                    tolerance: DEFAULT_TOLERANCE,
+                    sub_project: None,
+                },
+                TimeStamp {
+                    typ: TimeStampType::End,
+                    time: time!(11:03:00),
+                    tolerance: DEFAULT_TOLERANCE,
+                    sub_project: None,
+                },
+            ],
+        );
+        let mut record = record!(2025-12-02, 11:44:00, initial);
+        record.insert(String::new(), Some("foo".into()));
+        assert_eq!(
+            record.log,
+            on_date(
+                date!(2025 - 12 - 02),
+                vec![
+                    TimeStamp {
+                        typ: TimeStampType::Start,
+                        time: time!(11:00:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None,
+                    },
+                    TimeStamp {
+                        typ: TimeStampType::End,
+                        time: time!(11:03:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: None,
+                    },
+                    TimeStamp {
+                        typ: TimeStampType::Start,
+                        time: time!(11:44:00),
+                        tolerance: DEFAULT_TOLERANCE,
+                        sub_project: Some("foo".into()),
+                    },
+                ],
+            )
+        );
+    }
 }

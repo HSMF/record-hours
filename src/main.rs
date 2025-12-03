@@ -126,6 +126,7 @@ pub enum Commands {
         /// %h => hours that have been recorded
         /// %m => minutes that have been recorded
         /// %P => the project
+        /// %p => the subproject
         /// %% => a literal '%'
         #[clap(short, long)]
         format: Option<String>,
@@ -239,9 +240,11 @@ impl Record {
     }
 }
 
+#[derive(Clone)]
 struct Item {
     start: Time,
-    end: Time,
+    end: Option<Time>,
+    project: Option<String>,
 }
 
 struct MyDuration(Duration);
@@ -267,28 +270,42 @@ impl Display for DecimalDuration {
 
 fn show<F>(input: impl Read, project: &str, display: F) -> anyhow::Result<()>
 where
-    F: Fn(&Date, Vec<Item>, Option<Time>) -> anyhow::Result<()>,
+    F: Fn(&Date, Vec<Item>) -> anyhow::Result<()>,
 {
-    fn get_times<'a>(
-        mut iter: impl Iterator<Item = &'a TimeStamp>,
-        mut start: Time,
-    ) -> (Vec<Item>, Option<Time>) {
-        let mut items = vec![];
-        while let Some(head) = iter.next() {
-            if head.is_start() {
-                start = head.time;
-            } else {
-                items.push(Item {
-                    start,
-                    end: head.time,
-                });
-                let Some(next) = iter.find(|x| x.is_start()) else {
-                    return (items, None);
-                };
-                start = next.time;
+    fn get_times<'a>(iter: impl Iterator<Item = &'a TimeStamp>) -> Vec<Item> {
+        let mut ret = vec![];
+        let mut iter = iter.peekable();
+        loop {
+            let Some(head) = iter.next() else { break };
+            if !head.is_start() {
+                // bad input, must start with `start`, ignore
+                continue;
             }
+
+            let Some(tail) = iter.peek() else {
+                ret.push(Item {
+                    start: head.time,
+                    end: None,
+                    project: head.sub_project.clone(),
+                });
+                break;
+            };
+            if tail.is_start() {
+                // two consecutive starts, ignore
+                continue;
+            }
+            let tail = iter.next().unwrap();
+            if tail.sub_project != head.sub_project {
+                // not the same sub project, ignore
+                continue;
+            }
+            ret.push(Item {
+                start: head.time,
+                end: Some(tail.time),
+                project: head.sub_project.clone(),
+            });
         }
-        (items, Some(start))
+        ret
     }
 
     let stored: Log = serde_json::from_reader(input).context("input file was missing")?;
@@ -299,17 +316,38 @@ where
         .ok_or(anyhow!("project {project} is not present in log file"))?;
 
     for (date, day) in project_info.entries.iter() {
-        let mut iter = day.iter();
-        let Some(start) = iter.find(|x| x.is_start()) else {
+        let times = get_times(day.iter());
+        if times.is_empty() {
             log::warn!("day {date} is present in {project} but was empty");
-            continue;
-        };
-        let times = get_times(iter, start.time);
+        }
 
-        display(date, times.0, times.1)?;
+        display(date, times)?;
     }
 
     Ok(())
+}
+
+/// coalesces times, ignoring the subproject
+/// turns [09:00-10:00 (proj A), 10:00-11:00 (proj B)]
+/// into [09:00-11:00 (proj A)]
+fn coalesce_times(it: impl IntoIterator<Item = Item>) -> Vec<Item> {
+    let mut it = it.into_iter();
+    let Some(mut cur) = it.next() else {
+        return vec![];
+    };
+
+    let mut ret = vec![];
+    for i in it {
+        if Some(i.start) == cur.end {
+            cur.end = i.end;
+        } else {
+            ret.push(cur);
+            cur = i;
+        }
+    }
+    ret.push(cur);
+
+    ret
 }
 
 fn main() -> anyhow::Result<()> {
@@ -358,11 +396,10 @@ fn main() -> anyhow::Result<()> {
             }
 
             if let Some(format) = &format {
-                show(infile, &project, |&date, times, _| {
-                    let duration: Duration = times.iter().map(|x| x.end.0 - x.start.0).sum();
+                show(infile, &project, |&date, times| {
                     let fmt = format::Formatter {
                         date,
-                        duration,
+                        times: &times,
                         format,
                         project: &project,
                     };
@@ -371,21 +408,30 @@ fn main() -> anyhow::Result<()> {
                 })?;
                 return Ok(());
             }
-            show(infile, &project, |date, times, last| {
+            show(infile, &project, |date, times| {
                 let mut f = std::io::stdout().lock();
-                let duration: Duration = times.iter().map(|x| x.end.0 - x.start.0).sum();
+                let duration: Duration = times
+                    .iter()
+                    .filter_map(|x| x.end.map(|end| end.0 - x.start.0))
+                    .sum();
 
-                let duration: Box<dyn Display> = if decimal {
-                    Box::new(DecimalDuration(duration))
+                let duration = if decimal {
+                    DecimalDuration(duration).to_string()
                 } else {
-                    Box::new(MyDuration(duration))
+                    MyDuration(duration).to_string()
                 };
                 writeln!(f, "{date} ({}):", duration)?;
-                for Item { start, end } in times {
-                    writeln!(f, "  - {start} - {end}")?;
-                }
-                if let Some(start) = last {
-                    writeln!(f, "  - {start} - ")?;
+                for Item {
+                    start,
+                    end,
+                    project: _,
+                } in coalesce_times(times)
+                {
+                    if let Some(end) = end {
+                        writeln!(f, "  - {start} - {end}")?;
+                    } else {
+                        writeln!(f, "  - {start} - ")?;
+                    }
                 }
                 Ok(())
             })?;
